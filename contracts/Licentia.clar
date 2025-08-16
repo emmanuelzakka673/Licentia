@@ -19,10 +19,17 @@
 (define-constant ERR_NO_BIDS (err u110))
 (define-constant ERR_CANNOT_BID_OWN_AUCTION (err u111))
 (define-constant ERR_RESERVE_NOT_MET (err u112))
+(define-constant ERR_NOT_STAKED (err u113))
+(define-constant ERR_ALREADY_STAKED (err u114))
+(define-constant ERR_INVALID_STAKE_PERIOD (err u115))
+(define-constant ERR_STAKE_LOCKED (err u116))
+(define-constant ERR_INSUFFICIENT_REWARDS (err u117))
+(define-constant ERR_INVALID_POOL (err u118))
 
 (define-data-var license-id-nonce uint u0)
 (define-data-var platform-fee uint u50)
 (define-data-var auction-id-nonce uint u0)
+(define-data-var total-staked-licenses uint u0)
 
 (define-map licenses
   uint
@@ -97,6 +104,225 @@
 )
 
 (define-map bidder-escrow principal uint)
+
+(define-map staked-licenses
+  { license-id: uint, holder: principal }
+  {
+    stake-amount: uint,
+    stake-start: uint,
+    stake-period: uint,
+    lock-end: uint,
+    reward-rate: uint,
+    last-claim: uint,
+    total-rewards: uint
+  }
+)
+
+(define-map license-stake-pools
+  uint
+  {
+    creator: principal,
+    total-pool: uint,
+    reward-per-block: uint,
+    min-stake-period: uint,
+    bonus-multiplier: uint,
+    active: bool,
+    total-stakers: uint,
+    pool-end: uint
+  }
+)
+
+(define-map staker-rewards
+  principal
+  {
+    total-earned: uint,
+    total-claimed: uint,
+    active-stakes: uint
+  }
+)
+
+(define-map stake-multipliers
+  uint
+  uint
+)
+
+(define-public (create-stake-pool
+  (license-id uint)
+  (total-pool-amount uint)
+  (reward-per-block uint)
+  (min-stake-period uint)
+  (bonus-multiplier uint)
+  (pool-duration uint))
+  (let
+    (
+      (license-data (unwrap! (map-get? licenses license-id) ERR_NOT_FOUND))
+      (pool-end-block (+ stacks-block-height pool-duration))
+    )
+    (asserts! (is-eq tx-sender (get creator license-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (> total-pool-amount u0) ERR_INVALID_POOL)
+    (asserts! (> reward-per-block u0) ERR_INVALID_POOL)
+    (asserts! (> min-stake-period u0) ERR_INVALID_STAKE_PERIOD)
+    (asserts! (>= (stx-get-balance tx-sender) total-pool-amount) ERR_INSUFFICIENT_PAYMENT)
+    
+    (try! (stx-transfer? total-pool-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set license-stake-pools license-id
+      {
+        creator: tx-sender,
+        total-pool: total-pool-amount,
+        reward-per-block: reward-per-block,
+        min-stake-period: min-stake-period,
+        bonus-multiplier: bonus-multiplier,
+        active: true,
+        total-stakers: u0,
+        pool-end: pool-end-block
+      }
+    )
+    
+    (map-set stake-multipliers u144 u110)
+    (map-set stake-multipliers u1008 u125)
+    (map-set stake-multipliers u4320 u150)
+    (ok true)
+  )
+)
+
+(define-public (stake-license 
+  (license-id uint)
+  (stake-period uint))
+  (let
+    (
+      (holder-key { license-id: license-id, holder: tx-sender })
+      (license-data (unwrap! (map-get? licenses license-id) ERR_NOT_FOUND))
+      (holder-data (unwrap! (map-get? license-holders holder-key) ERR_NOT_AUTHORIZED))
+      (pool-data (unwrap! (map-get? license-stake-pools license-id) ERR_INVALID_POOL))
+      (stake-key { license-id: license-id, holder: tx-sender })
+      (license-price (get price license-data))
+      (lock-end-block (+ stacks-block-height stake-period))
+      (multiplier (calculate-multiplier stake-period))
+      (reward-rate (/ (* (get reward-per-block pool-data) multiplier) u100))
+      (current-staker-rewards (default-to { total-earned: u0, total-claimed: u0, active-stakes: u0 } (map-get? staker-rewards tx-sender)))
+    )
+    (asserts! (get active pool-data) ERR_INVALID_POOL)
+    (asserts! (< stacks-block-height (get expires-at holder-data)) ERR_EXPIRED_LICENSE)
+    (asserts! (>= stake-period (get min-stake-period pool-data)) ERR_INVALID_STAKE_PERIOD)
+    (asserts! (< stacks-block-height (get pool-end pool-data)) ERR_INVALID_POOL)
+    (asserts! (is-none (map-get? staked-licenses stake-key)) ERR_ALREADY_STAKED)
+    
+    (map-set staked-licenses stake-key
+      {
+        stake-amount: license-price,
+        stake-start: stacks-block-height,
+        stake-period: stake-period,
+        lock-end: lock-end-block,
+        reward-rate: reward-rate,
+        last-claim: stacks-block-height,
+        total-rewards: u0
+      }
+    )
+    
+    (map-set license-stake-pools license-id
+      (merge pool-data { total-stakers: (+ (get total-stakers pool-data) u1) })
+    )
+    
+    (map-set staker-rewards tx-sender
+      (merge current-staker-rewards { active-stakes: (+ (get active-stakes current-staker-rewards) u1) })
+    )
+    
+    (var-set total-staked-licenses (+ (var-get total-staked-licenses) u1))
+    (ok true)
+  )
+)
+
+(define-public (unstake-license (license-id uint))
+  (let
+    (
+      (stake-key { license-id: license-id, holder: tx-sender })
+      (stake-data (unwrap! (map-get? staked-licenses stake-key) ERR_NOT_STAKED))
+      (pool-data (unwrap! (map-get? license-stake-pools license-id) ERR_INVALID_POOL))
+      (current-staker-rewards (default-to { total-earned: u0, total-claimed: u0, active-stakes: u0 } (map-get? staker-rewards tx-sender)))
+      (blocks-staked (- stacks-block-height (get stake-start stake-data)))
+      (earned-rewards (/ (* (get reward-rate stake-data) blocks-staked) u144))
+      (early-penalty (if (< stacks-block-height (get lock-end stake-data)) (/ earned-rewards u4) u0))
+      (final-rewards (- earned-rewards early-penalty))
+    )
+    (asserts! (>= (get total-pool pool-data) final-rewards) ERR_INSUFFICIENT_REWARDS)
+    
+    (if (> final-rewards u0)
+      (unwrap! (as-contract (stx-transfer? final-rewards tx-sender tx-sender)) ERR_INSUFFICIENT_REWARDS)
+      true
+    )
+    
+    (map-delete staked-licenses stake-key)
+    
+    (map-set license-stake-pools license-id
+      (merge pool-data { 
+        total-stakers: (- (get total-stakers pool-data) u1),
+        total-pool: (- (get total-pool pool-data) final-rewards)
+      })
+    )
+    
+    (map-set staker-rewards tx-sender
+      (merge current-staker-rewards { 
+        total-earned: (+ (get total-earned current-staker-rewards) final-rewards),
+        total-claimed: (+ (get total-claimed current-staker-rewards) final-rewards),
+        active-stakes: (- (get active-stakes current-staker-rewards) u1)
+      })
+    )
+    
+    (var-set total-staked-licenses (- (var-get total-staked-licenses) u1))
+    (ok final-rewards)
+  )
+)
+
+(define-public (claim-staking-rewards (license-id uint))
+  (let
+    (
+      (stake-key { license-id: license-id, holder: tx-sender })
+      (stake-data (unwrap! (map-get? staked-licenses stake-key) ERR_NOT_STAKED))
+      (pool-data (unwrap! (map-get? license-stake-pools license-id) ERR_INVALID_POOL))
+      (current-staker-rewards (default-to { total-earned: u0, total-claimed: u0, active-stakes: u0 } (map-get? staker-rewards tx-sender)))
+      (blocks-since-claim (- stacks-block-height (get last-claim stake-data)))
+      (pending-rewards (/ (* (get reward-rate stake-data) blocks-since-claim) u144))
+    )
+    (asserts! (> pending-rewards u0) ERR_INSUFFICIENT_REWARDS)
+    (asserts! (>= (get total-pool pool-data) pending-rewards) ERR_INSUFFICIENT_REWARDS)
+    
+    (try! (as-contract (stx-transfer? pending-rewards tx-sender tx-sender)))
+    
+    (map-set staked-licenses stake-key
+      (merge stake-data { 
+        last-claim: stacks-block-height,
+        total-rewards: (+ (get total-rewards stake-data) pending-rewards)
+      })
+    )
+    
+    (map-set license-stake-pools license-id
+      (merge pool-data { total-pool: (- (get total-pool pool-data) pending-rewards) })
+    )
+    
+    (map-set staker-rewards tx-sender
+      (merge current-staker-rewards { 
+        total-earned: (+ (get total-earned current-staker-rewards) pending-rewards),
+        total-claimed: (+ (get total-claimed current-staker-rewards) pending-rewards)
+      })
+    )
+    
+    (ok pending-rewards)
+  )
+)
+
+(define-private (calculate-multiplier (stake-period uint))
+  (if (>= stake-period u4320)
+    u150
+    (if (>= stake-period u1008)
+      u125
+      (if (>= stake-period u144)
+        u110
+        u100
+      )
+    )
+  )
+)
 
 (define-public (create-license-auction
   (license-id uint)
@@ -556,3 +782,58 @@
     none
   )
 )
+
+(define-read-only (get-stake-info (license-id uint) (holder principal))
+  (map-get? staked-licenses { license-id: license-id, holder: holder })
+)
+
+(define-read-only (get-stake-pool (license-id uint))
+  (map-get? license-stake-pools license-id)
+)
+
+(define-read-only (get-staker-rewards (staker principal))
+  (default-to { total-earned: u0, total-claimed: u0, active-stakes: u0 } (map-get? staker-rewards staker))
+)
+
+(define-read-only (calculate-pending-rewards (license-id uint) (holder principal))
+  (match (map-get? staked-licenses { license-id: license-id, holder: holder })
+    stake-data
+      (let
+        (
+          (blocks-since-claim (- stacks-block-height (get last-claim stake-data)))
+          (pending-rewards (/ (* (get reward-rate stake-data) blocks-since-claim) u144))
+        )
+        (some pending-rewards)
+      )
+    none
+  )
+)
+
+(define-read-only (is-stake-locked (license-id uint) (holder principal))
+  (match (map-get? staked-licenses { license-id: license-id, holder: holder })
+    stake-data (< stacks-block-height (get lock-end stake-data))
+    false
+  )
+)
+
+(define-read-only (get-stake-time-remaining (license-id uint) (holder principal))
+  (match (map-get? staked-licenses { license-id: license-id, holder: holder })
+    stake-data
+      (if (< stacks-block-height (get lock-end stake-data))
+        (some (- (get lock-end stake-data) stacks-block-height))
+        none
+      )
+    none
+  )
+)
+
+(define-read-only (get-total-staked-licenses)
+  (var-get total-staked-licenses)
+)
+
+(define-read-only (get-stake-multiplier (period uint))
+  (calculate-multiplier period)
+)
+
+
+
